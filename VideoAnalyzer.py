@@ -5,32 +5,16 @@ import sys
 import cv2
 import numpy as np
 import tkinter as tk
-from tkinter import filedialog
 import torch
 import matplotlib
 
-from huggingface_hub import login
-from huggingface_hub import snapshot_download
-
+from tkinter import filedialog
 from transformers import Sam3Processor, Sam3Model
 import requests
+from Constants import UP_KEYS, DOWN_KEYS, LEFT_KEYS, RIGHT_KEYS, ENTER_KEYS, BACKSPACE_KEYS, PRINTABLE_ASCII_RANGE, SAM_MODEL
 
-# download the model
-
-# SAM3 git repo with isntallation details
-# https://github.com/facebookresearch/sam3/tree/main
-
-# arrow buttons key mappings for different platforms
-UP_KEYS = {2490368, 65362, 82, 63232, 0}
-DOWN_KEYS = {2621440, 65364, 84, 63233, 1}
-LEFT_KEYS = {2424832, 65361, 81, 63234, 2}
-RIGHT_KEYS = {2555904, 65363, 83, 63235, 3}
-ENTER_KEYS = {13}
-BACKSPACE_KEYS = {8, 127}
-PRINTABLE_ASCII_RANGE = range(32, 127)
-
-class OpenCVVideoUI:
-
+class VideoAnalyzer:
+	
 	def __init__(self, model, processor, device):    
 		# file selector dialog, closing file dialog window will close the app
 		self.video_path = self.select_video_file()
@@ -52,9 +36,12 @@ class OpenCVVideoUI:
 		self.current_frame = None
 
 		# Interaction & Analytics State
-		self.clicks = []          # Stores (x, y, label)
+		self.clicks = []
+		self.found_masks = []
 		self.text_input_mode = False
-		self.text_prompt = ""     # Live text typed for SAM
+		self.text_prompt = ""
+		self.last_processed_state = None
+		self.clean_frame = None
 
 		# Setup OpenCV Window & Mouse Callback
 		self.window_name = "OpenCV SAM Video Processor"
@@ -64,17 +51,11 @@ class OpenCVVideoUI:
 		# Create Timeline Trackbar
 		cv2.createTrackbar("Timeline", self.window_name, 0, self.total_frames - 1, self.on_trackbar)
 
-		# # SAM3 part
-		# self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+		self.buttons = []
 
 		self.model = model
 		self.processor = processor
 		self.device = device
-		# print(f"DEVICE IS: {self.device}")
-		# self.model = Sam3Model.from_pretrained("facebook/sam3").to(self.device)
-		# self.processor = Sam3Processor.from_pretrained("facebook/sam3")
-
-		# print('Parameters: %.0fM' % (self.model.num_parameters() / 1e6))
 
 		return
 
@@ -93,26 +74,88 @@ class OpenCVVideoUI:
 		if not self.paused:
 			return
 
+		self.clear_frame_history_data()
 		self.current_frame_idx = val
 		self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame_idx)
 		ret, frame = self.cap.read()
 		if ret:
 			self.current_frame = frame
+			self.clean_frame = frame.copy()
 			self.refresh_display()
 
-	# mouse callbacks
-	def mouse_callback(self, event, x, y, flags, param):
-		if self.paused and not self.text_input_mode:
-			if event == cv2.EVENT_LBUTTONDOWN:
-				self.clicks.append((x, y, 1)) # Foreground point
-				print(f"[Point Prompt] Added Positive at ({x}, {y})")
-				self.refresh_display()
-			elif event == cv2.EVENT_RBUTTONDOWN:
-				self.clicks.append((x, y, 0)) # Background point
-				print(f"[Point Prompt] Added Negative at ({x}, {y})")
-				self.refresh_display()
+	def register_button(self, label, width, height, callback, bg_color=(50, 50, 200)):
+		self.buttons.append({
+			"label": label,
+			"width": width,
+			"height": height,
+			"callback": callback,
+			"bg_color": bg_color,
+			"rect": None
+		})
 
-	def draw_status_bar(self, display_img):
+		return
+
+	def draw_ui_buttons(self, display_img, w):
+		margin = 10
+		start_x = w - margin - self.buttons[0]["width"]
+		y_pos = 10
+
+		for i, btn in enumerate(self.buttons):
+			btn_width = btn["width"]
+			btn_height = btn["height"]
+
+			bx1 = start_x - (i * (btn_width + margin))
+			by1 = y_pos
+			bx2 = bx1 + btn_width
+			by2 = by1 + btn_height
+			
+			btn["rect"] = (bx1, by1, bx2, by2)
+
+			# Draw button background and border
+			cv2.rectangle(display_img, (bx1, by1), (bx2, by2), btn["bg_color"], -1)
+			cv2.rectangle(display_img, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+			
+			# Center text inside button
+			cv2.putText(display_img, btn["label"], (bx1 + 12, by1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+		return
+
+	def mouse_callback(self, event, x, y, flags, param):
+		if event == cv2.EVENT_LBUTTONDOWN:
+			# 1. Check if any UI button was clicked
+			for btn in self.buttons:
+				if btn["rect"] is not None:
+					bx1, by1, bx2, by2 = btn["rect"]
+					if bx1 <= x <= bx2 and by1 <= y <= by2:
+						btn["callback"]()  # Trigger the registered action function
+						return
+
+			# 2. Otherwise, handle normal point prompts if paused and not typing text
+			# if self.paused and not self.text_input_mode:
+			# 	self.clicks.append((x, y, 1)) # Foreground point
+			# 	print(f"[Point Prompt] Added Positive at ({x}, {y})")
+			# 	self.refresh_display()
+				
+		# elif event == cv2.EVENT_RBUTTONDOWN:
+		# 	if self.paused and not self.text_input_mode:
+		# 		self.clicks.append((x, y, 0)) # Background point
+		# 		print(f"[Point Prompt] Added Negative at ({x}, {y})")
+		# 		self.refresh_display()
+		
+		return
+
+	def action_reset_frame(self):
+		print("[UI] 'Reset Frame' button clicked. Restoring original image.")
+		if self.clean_frame is not None:
+			self.current_frame = self.clean_frame.copy()
+		self.clicks.clear()
+		self.text_prompt = ""
+		self.last_processed_state = None
+		self.refresh_display()
+
+		return
+
+	def draw_overlay(self, display_img):
 		h, w, _ = display_img.shape
 
 		cv2.rectangle(display_img, (0, 0), (w, 50), (30, 30, 30), -1)
@@ -121,8 +164,11 @@ class OpenCVVideoUI:
 		status = f"Frame: {self.current_frame_idx}/{self.total_frames} | {paying_state :<7}"
 		cv2.putText(display_img, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
+		self.draw_ui_buttons(display_img, w)
+
 	# refresh display
 	def refresh_display(self):
+
 		if self.current_frame is None:
 			return
 
@@ -136,7 +182,7 @@ class OpenCVVideoUI:
 			cv2.circle(display_img, (x, y), 7, (255, 255, 255), 1)
 
 		# 2. Draw Top Status Banner
-		self.draw_status_bar(display_img)
+		self.draw_overlay(display_img)
 
 		# 3. Draw In-Window Text Box Banner at the Bottom
 		box_color = (0, 100, 255) if self.text_input_mode else (50, 50, 50)
@@ -148,22 +194,64 @@ class OpenCVVideoUI:
 			prompt_display = f"SAM Text Prompt: '{self.text_prompt}' (Press 't' to edit)"
 			
 		cv2.putText(display_img, prompt_display, (20, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
 		# Update trackbar position
 		cv2.setTrackbarPos("Timeline", self.window_name, self.current_frame_idx)
 		cv2.imshow(self.window_name, display_img)
 
-	def run(self):
-		if not self.cap or not self.cap.isOpened():
-			return False
+		return
 
-		# Read first frame
-		ret, frame = self.cap.read()
-		if ret:
-			self.current_frame = frame
+	def handle_text_prompt_typing(self, key):
+		# Enter key saves text prompt
+		if key in ENTER_KEYS:
+			self.text_input_mode = False
+			print(f"-> Text Prompt Confirmed: '{self.text_prompt}'")
+			self.perform_sam_text_analysis()
 			self.refresh_display()
+		# Backspace
+		elif key in BACKSPACE_KEYS:
+			self.text_prompt = self.text_prompt[:-1]
+			self.refresh_display()
+		# printable ASCII characters
+		elif key in PRINTABLE_ASCII_RANGE:
+			self.text_prompt += chr(key)
+			self.refresh_display()
+		
+		return
+	
+	def isolate_masked_objects_from_frame(self):
+		all_flattened_masks = []
+		for mask_set in self.found_masks:
+			for single_mask in mask_set:
+				binary_m = (single_mask > 0).astype(np.uint8) * 255
+				all_flattened_masks.append(binary_m)
 
-		inputs = self.processor(images=self.current_frame, text="car", return_tensors="pt").to(self.device)
+		self.current_frame = self.clean_frame.copy()
+
+		if all_flattened_masks:
+			stacked_masks = np.array(all_flattened_masks)
+			combined_union_mask = np.max(stacked_masks, axis=0)
+			# 3. Apply mask to the pristine clean frame (Removes background data completely)
+			isolated_objects_frame = cv2.bitwise_and(
+				self.clean_frame, 
+				self.clean_frame, 
+				mask=combined_union_mask
+			)
+			# Update working frame to show only the isolated objects
+			self.current_frame = isolated_objects_frame.copy()
+
+		self.found_masks.clear()
+		self.refresh_display()
+
+		return
+
+	def perform_sam_text_analysis(self):
+		is_text_empty = not self.text_prompt or not self.text_prompt.strip()
+		if is_text_empty and not self.clicks:
+			print("[Warning] Cannot run analysis: Both text prompt and point prompts are empty!")
+			print(" -> Type a text prompt using 't' or click on the video frame to add points.")
+			return
+			
+		inputs = self.processor(images=self.current_frame, text=self.text_prompt, return_tensors="pt").to(self.device)
 		with torch.no_grad():
 			outputs = self.model(**inputs)
 
@@ -176,22 +264,17 @@ class OpenCVVideoUI:
 
 		print(f"Found {len(results['masks'])} objects")
 
-		results = self.processor.post_process_instance_segmentation(
-			outputs,
-			threshold=0.5,
-			mask_threshold=0.5,
-			target_sizes=inputs.get("original_sizes").tolist()
-		)[0]
-
 		masks = results["masks"]
 		masks = 255 * masks.cpu().numpy().astype(np.uint8)
-    
+	
 		n_masks = masks.shape[0]
 		cmap = matplotlib.colormaps.get_cmap("rainbow").resampled(n_masks)
 		colors = [
 			tuple(int(c * 255) for c in cmap(i)[:3])
 			for i in range(n_masks)
 		]
+
+		self.found_masks.append(masks)
 
 		for mask, color in zip(masks, colors):
 			# Ensure mask is binary (0 or 1)
@@ -210,16 +293,34 @@ class OpenCVVideoUI:
 			# alpha = 0.5, beta = 1.0, gamma = 0.0
 			self.current_frame = cv2.addWeighted(self.current_frame, 1.0, colored_mask, 0.5, 0)
 
-		self.refresh_display()
+		self.text_prompt = ''
 
+		return
+
+	def print_controls(self):
 		print("\n--- CONTROLS ---")
 		print("[SPACEBAR] : Toggle Play / Pause")
 		print("[ RIGHT ARROW ] : Step 1 frame forward")
 		print("[ LEFT ARROW ]  : Step 1 frame backward")
-		print("[ T ]           : Activate In-Window Text Prompt Typing Mode")
-		print("[ S ]           : Run SAM Analysis on current frame")
-		print("[ C ]           : Clear prompts")
 		print("[ Q ]           : Quit\n")
+
+		return
+
+	def run(self):
+		if not self.cap or not self.cap.isOpened():
+			return False
+
+		self.register_button("Reset Frame", 100, 30, self.action_reset_frame, bg_color=(50, 50, 200))
+		self.register_button("Show found objects", 130, 30,  self.isolate_masked_objects_from_frame , bg_color=(50, 50, 200))
+
+		# Read first frame
+		ret, frame = self.cap.read()
+		if ret:
+			self.clean_frame = frame.copy()
+			self.current_frame = frame
+			self.refresh_display()
+
+		self.print_controls()
 
 		should_open_new = False
 		while self.cap.isOpened():
@@ -245,23 +346,12 @@ class OpenCVVideoUI:
 				should_open_new = False
 				break
 
-			# --- TEXT TYPING MODE HANDLER ---
+			# handle text prompt
 			if self.text_input_mode:
-				# Enter key saves text prompt
-				if key in ENTER_KEYS:
-					self.text_input_mode = False
-					print(f"-> Text Prompt Confirmed: '{self.text_prompt}'")
-					self.refresh_display()
-				# Backspace
-				elif key in BACKSPACE_KEYS:
-					self.text_prompt = self.text_prompt[:-1]
-					self.refresh_display()
-				# printable ASCII characters
-				elif key in PRINTABLE_ASCII_RANGE:
-					self.text_prompt += chr(key)
-					self.refresh_display()
-				continue # Skip standard shortcuts while typing text
+				self.handle_text_prompt_typing(key)
+				continue
 
+			# handle standard controls
 			self.handle_standard_controls(key)
 
 		self.cap.release()
@@ -270,6 +360,7 @@ class OpenCVVideoUI:
 
 	# step frame in direction
 	def step_frames(self, direction):
+		self.clear_frame_history_data()
 		self.set_pause_state(True)
 
 		new_idx = self.current_frame_idx + direction
@@ -279,6 +370,7 @@ class OpenCVVideoUI:
 		ret, frame = self.cap.read()
 		if ret:
 			self.current_frame = frame
+			self.clean_frame = frame.copy()
 			self.refresh_display()
 
 	def set_pause_state(self, new_state):
@@ -306,64 +398,35 @@ class OpenCVVideoUI:
 				print("\n[Text Mode Active] Type your prompt on your keyboard. Press ENTER when done.")
 				self.refresh_display()
 		# run analysis
-		elif (key == ord('s') or key == ord('S')) and self.paused: 
-			print(f"\n[Running SAM Analysis]")
-			print(f" -> Frame: {self.current_frame_idx}")
-			print(f" -> Text Prompt: '{self.text_prompt}'")
-			print(f" -> Point Prompts: {self.clicks}")
+		# elif (key == ord('s') or key == ord('S')) and self.paused: 
+		# 	print(f"\n[Running SAM Analysis]")
+		# 	print(f" -> Frame: {self.current_frame_idx}")
+		# 	print(f" -> Text Prompt: '{self.text_prompt}'")
+		# 	print(f" -> Point Prompts: {self.clicks}")
 		# clear points
-		elif key == ord('c') or key == ord('C'): 
-			self.clicks.clear()
-			self.text_prompt = ""
-			print("Cleared all prompts.")
-			self.refresh_display()
+		# elif key == ord('c') or key == ord('C'): 
+		# 	self.clear_frame_history_data()
+		# 	self.refresh_display()
+
+	def clear_frame_history_data(self):
+		self.clicks.clear()
+		self.text_prompt = ""
+		self.last_processed_state = None
+		self.found_masks.clear()
+
+		return 	
 
 	def read_next_frame(self):
 		ret, frame = self.cap.read()
+		
 		if not ret:
 			self.paused = True
 			return False
 
+		self.clear_frame_history_data()
+		self.clean_frame = frame.copy()
 		self.current_frame = frame
 		self.current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 		self.refresh_display()
+
 		return True
-
-def main():
-	print("\n\nGreetings dear user, before using the following tool you need the following:\n")
-	print("1. Hugging face account\n")
-	print("2. Get access to the https://huggingface.co/facebook/sam3 repo\n")
-	print("3. You can authorize to Hugging face via access token or browser\n")
-
-	# login()
-
-	# local_model_path = snapshot_download(
-	# 	repo_id="facebook/sam3", 
-	# 	local_dir="./sam3_local_weights" # Saves it in a folder next to your script
-	# )
-
-	# print(f"\nModel downloaded to: {local_model_path}")
-
-	torch.backends.cuda.matmul.allow_tf32 = True
-	torch.backends.cudnn.allow_tf32 = True
-	torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-
-	# SAM3 part
-	device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-	print(f"DEVICE IS: {device}")
-	model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-	processor = Sam3Processor.from_pretrained("facebook/sam3")
-	print('Parameters: %.0fM' % (model.num_parameters() / 1e6))
-
-	while True:
-		app = OpenCVVideoUI(model, processor, device)
-		if not hasattr(app, 'cap') or app.cap is None:
-			break
-			
-		open_another = app.run()
-		if not open_another:
-			break    
-
-if __name__ == "__main__":    
-	main()
